@@ -1,11 +1,17 @@
 -- ===========================================================
--- Plugin Hexadecimal Viewer and Editor (Batch Rendering)
+-- Plugin Hexadecimal Viewer and Editor (Multithreaded Rendering)
 -- Author: 	Damian V. Cechov
 -- damianvcechov@gmail.com ©2026
 -- ===========================================================
 
 local M = {}
 M.disabled_buffers = {}
+-- Per-buffer state of an in-flight chunked load
+M.load_state = {}
+-- Per-buffer chunk storage. Tables read back from vim.b are detached
+-- copies, so the (mutated in place) raw chunk data lives here instead.
+M.buf_data = {}
+local uv = vim.uv or vim.loop
 local ns = vim.api.nvim_create_namespace("hexview_ns")
 local cursor_ns = vim.api.nvim_create_namespace("hexview_cursor_ns")
 
@@ -13,23 +19,44 @@ local cursor_ns = vim.api.nvim_create_namespace("hexview_cursor_ns")
 -- CONFIGURATION
 -- ============================================================
 M.bytes_per_line = 52
+M.auto_columns = true
 M.ascii_start_col = 0
 M.hex_width = 0
+-- Raw data is held in chunks of roughly this many bytes, aligned to a
+-- multiple of bytes_per_line, so that loading can be split across
+-- libuv worker threads. Smaller chunks keep the main-thread insert
+-- pauses short (smoother browsing while loading); bigger chunks
+-- reduce dispatch overhead.
+M.chunk_bytes = 256 * 1024
 
 -- ============================================================
 -- AUXILIARY FUNCTIONS
 -- ============================================================
-function M.setup_layout()
-	local width = 0
-	for i = 0, M.bytes_per_line - 1 do
-		width = width + 2
-		if (i + 1) % 4 == 0 and (i + 1) < M.bytes_per_line then
-			width = width + 3
-		else
-			width = width + 1
-		end
+local function hex_width_for(cols)
+	return cols * 3 + 2 * math.floor((cols - 1) / 4)
+end
+
+-- Total rendered line width for a given column count
+local function line_width_for(cols)
+	return 10 + hex_width_for(cols) + 3 + cols
+end
+
+function M.max_columns_for(width)
+	local cols = math.floor((width - 13) / 4.5)
+	if cols < 1 then
+		return 1
 	end
-	M.hex_width = width
+	while cols > 1 and line_width_for(cols) > width do
+		cols = cols - 1
+	end
+	while line_width_for(cols + 1) <= width do
+		cols = cols + 1
+	end
+	return cols
+end
+
+function M.setup_layout()
+	M.hex_width = hex_width_for(M.bytes_per_line)
 	M.ascii_start_col = 10 + M.hex_width + 3
 end
 
@@ -39,31 +66,311 @@ function M.get_byte(idx)
 		return edits[tostring(idx)]
 	end
 
-	if vim.b.hex_raw and idx <= (vim.b.hex_size or 0) then
-		return string.byte(vim.b.hex_raw, idx)
+	local d = M.buf_data[vim.api.nvim_get_current_buf()]
+	if d and idx <= (vim.b.hex_size or 0) then
+		local cs = d.chunk_size
+		if cs > 0 then
+			local ci = math.floor((idx - 1) / cs) + 1
+			local s = d.chunks[ci]
+			if s and idx <= (ci - 1) * cs + #s then
+				return string.byte(s, idx - (ci - 1) * cs)
+			end
+		end
 	end
 	return nil
 end
 
 -- ============================================================
--- 1. FETCH DATA
+-- 1. FETCH DATA (MULTI-CORE, NON-BLOCKING)
 -- ============================================================
-function M.load_binary()
-	local filepath = vim.api.nvim_buf_get_name(0)
-	local data = ""
+-- The file is loaded by libuv worker threads (uv.new_work): each
+-- worker reads one chunk from disk and pre-renders its hex lines, the
+-- main thread only splices the finished lines into the buffer. The
+-- editor stays responsive and browsable while loading; progress is
+-- shown in the statusline. The number of worker threads is controlled
+-- by the UV_THREADPOOL_SIZE environment variable (libuv default: 4).
 
-	local f = io.open(filepath, "rb")
-	if f then
-		data = f:read("*all")
+-- nvim_buf_set_lines respects 'modifiable', and loading must work on
+-- buffers that are locked against user input, so toggle it around the
+-- API writes.
+local function buf_set_lines(buf, start_i, end_i, lines)
+	local bo = vim.bo[buf]
+	local was_modifiable = bo.modifiable
+	if not was_modifiable then
+		bo.modifiable = true
+	end
+	vim.api.nvim_buf_set_lines(buf, start_i, end_i, false, lines)
+	if not was_modifiable then
+		bo.modifiable = false
+	end
+end
+
+-- Runs in a worker thread. It is serialized with string.dump, so it
+-- must not capture upvalues and may only use the Lua standard library.
+-- Line layout must stay in sync with M.generate_line_content().
+local read_work = nil
+if uv.new_work then
+	read_work = uv.new_work(function(path, offset, len, bpl, chunk_id, buf, gen)
+		local f = io.open(path, "rb")
+		if not f then
+			return "", "", chunk_id, buf, gen
+		end
+		f:seek("set", offset)
+		local raw = f:read(len)
 		f:close()
-	else
-		local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
-		data = table.concat(lines, "\n")
+		if not raw then
+			raw = ""
+		end
+		local n = #raw
+
+		local hex_lookup = {}
+		for i = 0, 255 do
+			hex_lookup[i + 1] = string.format("%02X", i)
+		end
+
+		-- Chunk offsets are multiples of bytes_per_line, so only the
+		-- last chunk of the file can contain a partial (padded) line.
+		local lines = {}
+		local line_no = 0
+		local pos = 1
+		while pos <= n do
+			local last = math.min(pos + bpl - 1, n)
+			local count = last - pos + 1
+			local parts = {}
+
+			line_no = line_no + 1
+			parts[1] = string.format("%08X: ", offset + pos - 1)
+
+			for i = 0, bpl - 1 do
+				if i < count then
+					local hx = hex_lookup[string.byte(raw, pos + i) + 1]
+					if (i + 1) % 4 == 0 and (i + 1) < bpl then
+						parts[#parts + 1] = hx .. " | "
+					else
+						parts[#parts + 1] = hx .. " "
+					end
+				else
+					if (i + 1) % 4 == 0 and (i + 1) < bpl then
+						parts[#parts + 1] = "   | "
+					else
+						parts[#parts + 1] = "   "
+					end
+				end
+			end
+
+			parts[#parts + 1] = " | "
+
+			for i = 0, bpl - 1 do
+				if i < count then
+					local c = string.byte(raw, pos + i)
+					if c >= 32 and c <= 126 then
+						parts[#parts + 1] = string.char(c)
+					else
+						parts[#parts + 1] = "."
+					end
+				else
+					parts[#parts + 1] = " "
+				end
+			end
+
+			lines[line_no] = table.concat(parts)
+			pos = last + 1
+		end
+
+		return raw, table.concat(lines, "\n"), chunk_id, buf, gen
+	end, vim.schedule_wrap(function(raw, text, chunk_id, buf, gen)
+		-- Runs in the main thread (via vim.schedule: the raw luv
+		-- callback is a fast event context that forbids API calls):
+		-- store the raw chunk and splice the rendered lines into the
+		-- buffer at their fixed rows.
+		if not vim.api.nvim_buf_is_valid(buf) then
+			M.load_state[buf] = nil
+			M.buf_data[buf] = nil
+			return
+		end
+		local state = M.load_state[buf]
+		if not state or state.gen ~= gen then
+			return
+		end
+
+		local d = M.buf_data[buf]
+		if not d or d.chunk_size == 0 then
+			return
+		end
+
+		d.chunks[chunk_id] = raw
+
+		local lines = {}
+		if text ~= "" then
+			lines = vim.split(text, "\n", { plain = true })
+		end
+		local chunk_lines = math.floor(d.chunk_size / state.bpl)
+		local start_row = (chunk_id - 1) * chunk_lines + 1
+		local end_row = start_row + #lines - 1
+
+		local buf_lines = vim.api.nvim_buf_line_count(buf)
+		if end_row > buf_lines then
+			local empties = {}
+			for i = 1, end_row - buf_lines do
+				empties[i] = ""
+			end
+			buf_set_lines(buf, buf_lines, buf_lines, empties)
+		end
+		if #lines > 0 then
+			buf_set_lines(buf, start_row - 1, end_row, lines)
+		end
+
+		local expected = math.min(d.chunk_size, state.size - (chunk_id - 1) * d.chunk_size)
+		if #raw < expected then
+			state.incomplete = true
+		end
+
+		state.loaded = state.loaded + #raw
+		state.done = state.done + 1
+		vim.b[buf].hex_loaded_bytes = state.loaded
+		if state.done >= state.nchunks then
+			M.finish_load(buf)
+		end
+	end))
+end
+
+-- Load the whole data set of a buffer synchronously (single chunk).
+-- Used when there is no readable file behind the buffer, or when
+-- uv.new_work is unavailable.
+local function set_buffer_data(buf, data, keep_edits)
+	local b = vim.b[buf]
+	if not keep_edits then
+		b.hex_edits = {}
+	end
+	b.hex_size = #data
+	b.hex_loaded_bytes = #data
+	b.hex_loading = false
+	M.buf_data[buf] = { chunks = { data }, chunk_size = math.max(#data, 1) }
+end
+
+-- Kick off an async chunked load of the file behind `buf`. Returns
+-- "async" when worker threads were dispatched, or "sync" when the data
+-- was loaded into memory synchronously (the caller must then render
+-- with M.refresh_view() itself).
+function M.start_load(buf, opts)
+	opts = opts or {}
+
+	local path = vim.api.nvim_buf_get_name(buf)
+	local size = 0
+	local f = io.open(path, "rb")
+	if f then
+		size = f:seek("end") or 0
+		f:close()
 	end
 
-	vim.b.hex_raw = data
-	vim.b.hex_size = #data
-	vim.b.hex_edits = {}
+	if not f or not read_work then
+		set_buffer_data(buf, table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n"), opts.keep_edits)
+		return "sync"
+	end
+
+	local prev = M.load_state[buf]
+	local gen = (prev and prev.gen or 0) + 1
+	local state = {
+		gen = gen,
+		size = size,
+		bpl = M.bytes_per_line,
+		loaded = 0,
+		done = 0,
+		nchunks = 0,
+		restore_offset = opts.restore_offset or 0,
+		initial = opts.initial or false,
+		silent = opts.silent or false,
+	}
+	M.load_state[buf] = state
+
+	local b = vim.b[buf]
+	if not opts.keep_edits then
+		b.hex_edits = {}
+	end
+	b.hex_size = size
+	b.hex_loaded_bytes = 0
+	b.hex_loading = true
+	b.hex_incomplete = false
+
+	-- The buffer is rebuilt from scratch as chunks arrive.
+	buf_set_lines(buf, 0, -1, {})
+
+	if size == 0 then
+		M.buf_data[buf] = { chunks = {}, chunk_size = 1 }
+		local text = M.generate_line_content(1)
+		buf_set_lines(buf, 0, -1, { text })
+		M.finish_load(buf)
+		return "async"
+	end
+
+	local chunk_size = math.ceil(M.chunk_bytes / M.bytes_per_line) * M.bytes_per_line
+	M.buf_data[buf] = { chunks = {}, chunk_size = chunk_size }
+	state.nchunks = math.ceil(size / chunk_size)
+
+	for i = 1, state.nchunks do
+		local offset = (i - 1) * chunk_size
+		local len = math.min(chunk_size, size - offset)
+		read_work:queue(path, offset, len, M.bytes_per_line, i, buf, gen)
+	end
+	return "async"
+end
+
+function M.finish_load(buf)
+	local state = M.load_state[buf]
+	M.load_state[buf] = nil
+	if not state or not vim.api.nvim_buf_is_valid(buf) then
+		return
+	end
+
+	local b = vim.b[buf]
+	b.hex_loading = false
+	b.hex_loaded_bytes = b.hex_size or 0
+	if state.incomplete then
+		b.hex_incomplete = true
+		if not state.silent then
+			print("HexView: Warning: file loaded incompletely, saving is disabled.")
+		end
+	end
+
+	-- Lines whose bytes were edited while chunks were still arriving
+	-- need their dirty text/highlights restored.
+	local edits = b.hex_edits or {}
+	if next(edits) ~= nil then
+		local rows = {}
+		for k, _ in pairs(edits) do
+			local off = tonumber(k)
+			if off and off >= 1 and off <= (b.hex_size or 0) then
+				rows[#rows + 1] = math.floor((off - 1) / state.bpl) + 1
+			end
+		end
+		if #rows > 0 then
+			if buf == vim.api.nvim_get_current_buf() then
+				for _, row in ipairs(rows) do
+					M.redraw_line(row)
+				end
+			else
+				b.hex_pending_redraw_rows = rows
+			end
+		end
+	end
+
+	local is_current = buf == vim.api.nvim_get_current_buf()
+	if state.restore_offset > 0 then
+		local row = math.floor((state.restore_offset - 1) / M.bytes_per_line) + 1
+		pcall(vim.api.nvim_win_set_cursor, 0, { row, 10 })
+	elseif state.initial and is_current then
+		local ok_c, cur = pcall(vim.api.nvim_win_get_cursor, 0)
+		if ok_c and cur[1] == 1 and cur[2] == 0 then
+			pcall(vim.api.nvim_win_set_cursor, 0, { 1, 10 })
+		end
+	end
+
+	if is_current then
+		M.highlight_cursor()
+		if not state.silent then
+			print(string.format("HexView: Loaded %d bytes.", b.hex_size or 0))
+		end
+	end
 end
 
 -- ============================================================
@@ -71,7 +378,7 @@ end
 -- ============================================================
 
 function M.generate_line_content(row)
-	if not vim.b.hex_raw then
+	if not M.buf_data[vim.api.nvim_get_current_buf()] then
 		return "", {}, {}
 	end
 
@@ -139,18 +446,22 @@ function M.generate_line_content(row)
 	return table.concat(parts), dirty_hex_ranges, dirty_ascii_indices
 end
 
-function M.redraw_line(row)
+function M.redraw_line(row, buf)
+	buf = buf or 0
+	local is_current = buf == 0 or buf == vim.api.nvim_get_current_buf()
 	local text, dirty_hex, dirty_ascii = M.generate_line_content(row)
 
-	vim.opt_local.modifiable = true
-	vim.api.nvim_buf_set_lines(0, row - 1, row, false, { text })
+	if is_current then
+		vim.opt_local.modifiable = true
+	end
+	vim.api.nvim_buf_set_lines(buf, row - 1, row, false, { text })
 
-	vim.api.nvim_buf_clear_namespace(0, ns, row - 1, row)
+	vim.api.nvim_buf_clear_namespace(buf, ns, row - 1, row)
 
 	local len = #text
 	for _, range in ipairs(dirty_hex) do
 		if range[2] <= len then
-			vim.api.nvim_buf_set_extmark(0, ns, row - 1, range[1], {
+			vim.api.nvim_buf_set_extmark(buf, ns, row - 1, range[1], {
 				end_col = range[2],
 				hl_group = "HexViewChanged",
 				priority = 101,
@@ -164,7 +475,7 @@ function M.redraw_line(row)
 	for _, offset_i in ipairs(dirty_ascii) do
 		local col = ascii_start + offset_i
 		if col < len then
-			vim.api.nvim_buf_set_extmark(0, ns, row - 1, col, {
+			vim.api.nvim_buf_set_extmark(buf, ns, row - 1, col, {
 				end_col = col + 1,
 				hl_group = "HexViewChanged",
 				priority = 101,
@@ -172,7 +483,9 @@ function M.redraw_line(row)
 		end
 	end
 
-	vim.opt_local.modifiable = false
+	if is_current then
+		vim.opt_local.modifiable = false
+	end
 end
 
 -- ============================================================
@@ -442,20 +755,108 @@ function M.goto_byte_offset(offset)
 	M.highlight_cursor()
 end
 
-function M.get_current_binary_string()
-	local size = vim.b.hex_size or 0
+-- Raw bytes in [a, b] (1-based, inclusive) from the loaded chunks.
+-- Stops at the first chunk that has not arrived yet.
+local function raw_range(a, b)
+	if b < a then
+		return ""
+	end
+	local d = M.buf_data[vim.api.nvim_get_current_buf()]
+	if not d or d.chunk_size <= 0 then
+		return ""
+	end
+	local chunks = d.chunks
+	local cs = d.chunk_size
+	local out = {}
+	local i = a
+	while i <= b do
+		local ci = math.floor((i - 1) / cs) + 1
+		local s = chunks[ci]
+		if not s or i > (ci - 1) * cs + #s then
+			break
+		end
+		local take = math.min(b, (ci - 1) * cs + #s)
+		out[#out + 1] = string.sub(s, i - (ci - 1) * cs, take - (ci - 1) * cs)
+		i = take + 1
+	end
+	return table.concat(out)
+end
+
+-- Bytes in [a, b] with the edit overlay applied. Truncated to the
+-- contiguously loaded prefix of the range so partially loaded files
+-- never produce corrupted data.
+local function binary_range(a, b)
+	if b < a then
+		return ""
+	end
+	local d = M.buf_data[vim.api.nvim_get_current_buf()]
+	if not d or d.chunk_size <= 0 then
+		return ""
+	end
+	local chunks = d.chunks
+	local cs = d.chunk_size
+
+	local ci = math.floor((a - 1) / cs) + 1
+	while true do
+		local s = chunks[ci]
+		if not s then
+			-- chunk ci covers [(ci-1)*cs+1, ci*cs]; it is missing, so
+			-- truncate to the last byte of the previous chunk
+			b = (ci - 1) * cs
+			break
+		end
+		local chunk_end = (ci - 1) * cs + #s
+		if chunk_end >= b or #s < cs then
+			break
+		end
+		ci = ci + 1
+	end
+	if b < a then
+		return ""
+	end
+
+	local marks = {}
 	local edits = vim.b.hex_edits or {}
-
-	if next(edits) == nil then
-		return vim.b.hex_raw
+	for k, v in pairs(edits) do
+		local off = tonumber(k)
+		if off and off >= a and off <= b then
+			marks[#marks + 1] = { off, v }
+		end
+	end
+	if #marks == 0 then
+		return raw_range(a, b)
 	end
 
-	local t = {}
-	for i = 1, size do
-		local b_val = M.get_byte(i)
-		table.insert(t, string.char(b_val))
+	table.sort(marks, function(x, y)
+		return x[1] < y[1]
+	end)
+
+	local out = {}
+	local pos = a
+	for _, m in ipairs(marks) do
+		if m[1] > pos then
+			out[#out + 1] = raw_range(pos, m[1] - 1)
+		end
+		out[#out + 1] = string.char(m[2])
+		pos = m[1] + 1
 	end
-	return table.concat(t)
+	if pos <= b then
+		out[#out + 1] = raw_range(pos, b)
+	end
+	return table.concat(out)
+end
+
+function M.get_current_binary_string()
+	return binary_range(1, vim.b.hex_size or 0)
+end
+
+function M.load_progress_pct()
+	local size = vim.b.hex_size or 0
+	if size <= 0 then
+		return 100
+	end
+	local loaded = vim.b.hex_loaded_bytes or 0
+	return math.floor(loaded / size * 100)
 end
 
 function M.find_hex_dialog()
@@ -513,6 +914,8 @@ function M.find_next()
 		M.goto_byte_offset(start_pos)
 		local len = end_pos - start_pos + 1
 		print(string.format("Found on offset 0x%X (length %d)", start_pos, len))
+	elseif vim.b.hex_loading then
+		print(string.format("HexView: None found so far (%d%% of file loaded).", M.load_progress_pct()))
 	else
 		print("HexView: None found.")
 	end
@@ -565,6 +968,8 @@ function M.get_statusline_content()
 	local mode_info = ""
 	if vim.b.hex_replace_active then
 		mode_info = "%#HexViewModeEdit# -- REPLACE -- %*"
+	elseif vim.b.hex_loading then
+		mode_info = "%#HexViewModeEdit# -- LOADING " .. M.load_progress_pct() .. "% -- %*"
 	end
 	return string.format("  %%f %%m %%= %s Col: %d  %%l,%%c  %%P ", mode_info, M.bytes_per_line)
 end
@@ -601,16 +1006,63 @@ end
 -- 7. ENABLE / DISABLE / REFRESH (OPTIMIZED)
 -- ============================================================
 
-function M.set_columns(cols)
-	if cols < 1 then
+local function apply_columns(cols)
+	if vim.b.hex_loading then
 		return
 	end
 	local current_offset = M.cursor_byte() or 0
 	M.bytes_per_line = cols
-	M.refresh_view()
-	local new_row = math.floor(current_offset / M.bytes_per_line) + 1
-	pcall(vim.api.nvim_win_set_cursor, 0, { new_row, 10 })
+	M.setup_layout()
+	M.setup_ui()
+	local buf = vim.api.nvim_get_current_buf()
+	local mode = M.start_load(buf, { keep_edits = true, restore_offset = current_offset, silent = true })
+	if mode == "sync" then
+		M.refresh_view()
+		if current_offset > 0 then
+			local new_row = math.floor((current_offset - 1) / M.bytes_per_line) + 1
+			pcall(vim.api.nvim_win_set_cursor, 0, { new_row, 10 })
+		end
+	end
+end
+
+function M.set_columns(cols)
+	if cols < 1 then
+		return
+	end
+	if vim.b.hex_loading then
+		print("HexView: Please wait, the file is still loading.")
+		return
+	end
+	M.auto_columns = false
+	apply_columns(cols)
 	print("HexView: Set on " .. cols .. " columns.")
+end
+
+-- Column changes re-render the whole file, so resize-triggered calls
+-- are debounced on a timer to avoid a stampede of reloads.
+local adapt_timer = nil
+
+function M.adapt_columns()
+	if not M.auto_columns or vim.b.hex_loading then
+		return
+	end
+	if not adapt_timer then
+		adapt_timer = uv.new_timer()
+	end
+	adapt_timer:stop()
+	adapt_timer:start(250, 0, vim.schedule_wrap(function()
+		if vim.bo.filetype ~= "hexview" or vim.b.hex_loading then
+			return
+		end
+		local ok, width = pcall(vim.api.nvim_win_get_width, 0)
+		if not ok or width <= 0 then
+			return
+		end
+		local cols = M.max_columns_for(width)
+		if cols ~= M.bytes_per_line then
+			apply_columns(cols)
+		end
+	end))
 end
 
 function M.refresh_view()
@@ -640,16 +1092,12 @@ function M.refresh_view()
 end
 
 function M.enable()
-	M.disabled_buffers[vim.api.nvim_get_current_buf()] = nil
-	M.load_binary()
-	if not vim.b.hex_raw then
-		vim.b.hex_raw = ""
-		vim.b.hex_size = 0
-	end
-	if not vim.b.hex_edits then
-		vim.b.hex_edits = {}
-	end
+	local buf = vim.api.nvim_get_current_buf()
+	M.disabled_buffers[buf] = nil
+
+	vim.b.hex_edits = {}
 	vim.b.hex_replace_active = false
+	vim.b.hex_loading = false
 
 	vim.opt_local.modifiable = true
 	vim.opt_local.readonly = false
@@ -658,8 +1106,25 @@ function M.enable()
 	vim.opt_local.wrap = false
 	vim.bo.filetype = "hexview"
 
-	M.refresh_view()
-	vim.api.nvim_win_set_cursor(0, { 1, 10 })
+	if M.auto_columns then
+		local ok, width = pcall(vim.api.nvim_win_get_width, 0)
+		if ok and width > 0 then
+			M.bytes_per_line = M.max_columns_for(width)
+		end
+	end
+	M.setup_layout()
+	M.setup_ui()
+
+	-- Start the multithreaded load; the buffer fills in as chunk
+	-- workers report back and stays browsable meanwhile.
+	local mode = M.start_load(buf, { initial = true })
+	if mode == "sync" then
+		M.refresh_view()
+	else
+		vim.opt_local.modifiable = false
+	end
+
+	pcall(vim.api.nvim_win_set_cursor, 0, { 1, 10 })
 	vim.b.did_ftplugin = 1
 	M.setup_keymaps()
 
@@ -669,17 +1134,62 @@ function M.enable()
 		buffer = 0,
 		callback = M.highlight_cursor,
 	})
+	vim.api.nvim_create_autocmd("VimResized", {
+		group = au_group,
+		buffer = 0,
+		callback = function()
+			M.adapt_columns()
+		end,
+	})
+	vim.api.nvim_create_autocmd("WinResized", {
+		group = au_group,
+		callback = function()
+			if vim.bo.filetype == "hexview" then
+				M.adapt_columns()
+			end
+		end,
+	})
+	vim.api.nvim_create_autocmd("BufEnter", {
+		group = au_group,
+		buffer = 0,
+		callback = function()
+			local pending = vim.b.hex_pending_redraw_rows
+			if pending then
+				vim.b.hex_pending_redraw_rows = nil
+				for _, row in ipairs(pending) do
+					M.redraw_line(row)
+				end
+			end
+			M.highlight_cursor()
+		end,
+	})
+	vim.api.nvim_create_autocmd("BufWipeout", {
+		group = au_group,
+		buffer = 0,
+		callback = function(ev)
+			M.load_state[ev.buf] = nil
+			M.buf_data[ev.buf] = nil
+		end,
+	})
 	M.highlight_cursor()
 
 	vim.api.nvim_create_autocmd("BufWriteCmd", { buffer = 0, callback = M.save })
 end
 
 function M.disable()
-	M.save()
 	local buf = vim.api.nvim_get_current_buf()
+	if vim.b.hex_loading then
+		-- Cancel the in-flight load; saving now would write a
+		-- truncated file.
+		M.load_state[buf] = nil
+		vim.b.hex_loading = false
+	else
+		M.save()
+	end
+	M.buf_data[buf] = nil
 	M.disabled_buffers[buf] = true
 
-	vim.api.nvim_clear_autocmds({ group = "HexViewCursor", buffer = 0 })
+	vim.api.nvim_clear_autocmds({ group = "HexViewCursor" })
 	vim.api.nvim_buf_clear_namespace(0, cursor_ns, 0, -1)
 	vim.api.nvim_clear_autocmds({ event = "BufWriteCmd", buffer = 0 })
 	pcall(vim.api.nvim_buf_del_user_command, 0, "HexSet")
@@ -694,9 +1204,11 @@ function M.disable()
 	vim.opt_local.statusline = ""
 	vim.opt_local.syntax = "off"
 	vim.bo.filetype = ""
-	vim.b.hex_raw = nil
 	vim.b.hex_edits = nil
 	vim.b.hex_size = nil
+	vim.b.hex_loaded_bytes = nil
+	vim.b.hex_pending_redraw_rows = nil
+	vim.b.hex_incomplete = nil
 	vim.b.hex_replace_active = nil
 	print("HexView: RAW mode.")
 end
@@ -707,30 +1219,33 @@ function M.save()
 		print("Error: Buffer has no name.")
 		return
 	end
-	local f = assert(io.open(name, "wb"))
-
-	local size = vim.b.hex_size or 0
-	local chunk_size = 1024 * 64
-	local buffer = {}
-
-	for i = 1, size do
-		local b = M.get_byte(i)
-		local val = tonumber(b) or 0
-		table.insert(buffer, string.char(val))
-
-		if #buffer >= chunk_size then
-			f:write(table.concat(buffer))
-			buffer = {}
-		end
+	if vim.b.hex_loading then
+		print("HexView: Save aborted, file is still loading.")
+		return
+	end
+	if vim.b.hex_incomplete then
+		print("HexView: Save aborted, the loaded data is incomplete.")
+		return
 	end
 
-	if #buffer > 0 then
-		f:write(table.concat(buffer))
+	local f = assert(io.open(name, "wb"))
+
+	-- Write in large windows so huge files never need a full-size
+	-- copy in memory.
+	local size = vim.b.hex_size or 0
+	local window = 4 * 1024 * 1024
+	local pos = 1
+	while pos <= size do
+		local endp = math.min(pos + window - 1, size)
+		f:write(binary_range(pos, endp))
+		pos = endp + 1
 	end
 	f:close()
 
-	M.load_binary()
-	M.refresh_view()
+	-- The file on disk now matches the rendered buffer, so the edit
+	-- overlay and its highlights can simply be dropped.
+	vim.b.hex_edits = {}
+	vim.api.nvim_buf_clear_namespace(0, ns, 0, -1)
 	vim.opt_local.modified = false
 	print("Writed")
 end
@@ -739,6 +1254,17 @@ end
 -- 8. SETUP
 -- ============================================================
 function M.setup(config)
+	config = config or {}
+	if config.auto_columns ~= nil then
+		M.auto_columns = config.auto_columns
+	end
+	if config.bytes_per_line then
+		M.bytes_per_line = config.bytes_per_line
+		M.auto_columns = false
+	end
+	if config.chunk_bytes then
+		M.chunk_bytes = config.chunk_bytes
+	end
 	M.setup_layout()
 	local group = vim.api.nvim_create_augroup("HexViewAutoDetect", { clear = true })
 	vim.api.nvim_create_autocmd("BufReadPost", {

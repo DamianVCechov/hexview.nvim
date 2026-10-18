@@ -9,11 +9,30 @@ A lightweight, pure Lua hex editor for Neovim.
 ## ✨ Features
 
 * **Pure Lua**: No external dependencies or binaries required.
+* **Multithreaded loading**: File chunks are read and rendered by libuv worker threads (`uv.new_work`), spread across CPU cores. You can browse and edit the file while it loads; the statusline shows load progress.
 * **Auto-detection**: Automatically enables itself for binary files or files containing null bytes.
 * **Smart Editing**: Edit directly in the Hex column or the ASCII column.
 * **Visual Feedback**: Highlights modified (dirty) bytes before saving.
 * **Smart Navigation**: `h`/`l` jumps correctly between nibbles and columns, skipping separators.
 * **Quick Search HEX string**: `/` locates and jumps to hex string
+
+## ⚡ Performance
+
+Loading is split into chunks that are read and hex-rendered in parallel by libuv worker threads; the main thread only splices the finished lines into the buffer. This keeps Neovim responsive on large files (hundreds of MB render in tens of seconds instead of minutes) and lets you start browsing immediately.
+
+Two knobs:
+
+* `UV_THREADPOOL_SIZE` environment variable (set before starting Neovim, default `4`): number of worker threads.
+* `chunk_bytes` in `setup()` (default `262144`): chunk size; smaller chunks keep insert pauses shorter while loading.
+
+```lua
+require("hexview").setup({ chunk_bytes = 256 * 1024 })
+```
+
+Notes on large files:
+
+* Saving is blocked while a load is in flight (and if a chunk failed to load), so an incomplete load can never write a truncated file.
+* Searching (`/`, `n`) searches the portion loaded so far and tells you how much of the file is available.
 
 
 ![Neovim HexView](/screenshot/screen.png)
@@ -76,11 +95,16 @@ n   Find next:       Continue searching
 Pass configuration options to the setup function.
 
 ```lua
-quire("hexview").setup({
-    -- Currently, the setup function initializes autocommands.
-    -- Future configuration options will go here.
+require("hexview").setup({
+    auto_columns = true,     -- Fit the number of bytes per line to the window
+                             -- width (default). Re-fits automatically on resize.
+    bytes_per_line = 16,     -- Fixed columns instead of adaptive sizing
+                             -- (implies auto_columns = false).
 })
 ```
+
+* The view adapts to the screen width on open and on `VimResized`/`WinResized`, so lines never exceed the window.
+* `:HexSet <columns>` sets a manual override and disables auto-fitting for the session.
 
 ## 🎨 Highlights
 * The plugin defines the following highlight groups, which you can override in your colorscheme:
